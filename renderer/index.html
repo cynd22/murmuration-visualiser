@@ -148,6 +148,23 @@
 			}
 			#bandToggles .row.disabled .name { color: #666; }
 			#bandToggles .desc { color: #888; font-size: 10px; }
+
+			/* Keep the tuning panel within the viewport and scroll the overflow.
+			   lil-gui's autoPlace caps height at 100% but never sets overflow, so on
+			   sub-4K screens the lower folders run off the bottom and are unreachable.
+			   Higher specificity than lil-gui's own .lil-gui.autoPlace rule so it wins
+			   regardless of stylesheet injection order. */
+			.lil-gui.root.autoPlace {
+				max-height: 100vh;
+				overflow-y: auto;
+				overflow-x: hidden;
+			}
+			.lil-gui.root.autoPlace::-webkit-scrollbar { width: 8px; }
+			.lil-gui.root.autoPlace::-webkit-scrollbar-thumb {
+				background: #555;
+				border-radius: 4px;
+			}
+			.lil-gui.root.autoPlace::-webkit-scrollbar-track { background: transparent; }
 </style>
 	</head>
 	<body>

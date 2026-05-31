@@ -1,6 +1,6 @@
 {
   "name": "murmuration-visualiser",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Audio-reactive 3D starling murmuration — standalone Windows build (system-audio loopback).",
   "main": "main.js",
   "author": "Kiseia",
@@ -24,7 +24,8 @@
       "capture-worklet.js"
     ],
     "win": {
-      "target": "portable"
+      "target": "portable",
+      "icon": "build/icon.ico"
     },
     "portable": {
       "artifactName": "Murmuration.exe"
