@@ -1,0 +1,7 @@
+node_modules/
+dist/
+# Local parity-test harness depends on the parent project (../../share, ../../test-audio); dev-only.
+verify/
+# Generated audio dumps
+*.raw
+*.jsonl

@@ -1,0 +1,33 @@
+{
+  "name": "murmuration-visualiser",
+  "version": "1.0.0",
+  "description": "Audio-reactive 3D starling murmuration — standalone Windows build (system-audio loopback).",
+  "main": "main.js",
+  "author": "Kiseia",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win portable --x64"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "com.kiseia.murmuration",
+    "productName": "Murmuration",
+    "files": [
+      "main.js",
+      "renderer/**/*",
+      "vendor/**/*",
+      "audio-engine.js",
+      "capture-worklet.js"
+    ],
+    "win": {
+      "target": "portable"
+    },
+    "portable": {
+      "artifactName": "Murmuration.exe"
+    }
+  }
+}

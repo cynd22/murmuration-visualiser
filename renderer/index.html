@@ -1,0 +1,2144 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<title>Murmuration · ONSETS build</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+		<style>
+			body {
+				background-color: #fff;
+				color: #444;
+				margin: 0;
+				overflow: hidden;
+				font-family: Monospace, sans-serif;
+				font-size: 13px;
+				line-height: 24px;
+			}
+			a {
+				color: #08f;
+			}
+
+			#audioReadout {
+				position: absolute;
+				bottom: 10px;
+				left: 10px;
+				padding: 8px 12px;
+				background: rgba(0, 0, 0, 0.55);
+				color: #ddd;
+				font-family: Monospace, sans-serif;
+				font-size: 12px;
+				line-height: 16px;
+				border-radius: 4px;
+				z-index: 1;
+				user-select: none;
+				pointer-events: none;
+			}
+			#audioReadout .header {
+				color: #aaa;
+				margin-bottom: 4px;
+				font-size: 11px;
+			}
+			#audioReadout .status {
+				display: inline-block;
+				width: 8px;
+				height: 8px;
+				border-radius: 50%;
+				margin-right: 6px;
+				vertical-align: middle;
+			}
+			#audioReadout .status.connected { background: #4f4; }
+			#audioReadout .status.disconnected { background: #f44; }
+			#audioReadout .status.nosignal { background: #fb3; }
+			#audioBanner {
+				position: fixed;
+				top: 50%;
+				left: 50%;
+				transform: translate( -50%, -50% );
+				padding: 14px 22px;
+				background: rgba( 0, 0, 0, 0.72 );
+				border: 1px solid #555;
+				border-radius: 6px;
+				color: #ddd;
+				font: 14px/1.4 monospace;
+				text-align: center;
+				z-index: 50;
+				pointer-events: none;
+				user-select: none;
+			}
+			#audioBanner.clickable {
+				cursor: pointer;
+				pointer-events: auto;
+				border-color: #4f8;
+				color: #eafff0;
+			}
+			#calibSplash {
+				position: fixed;
+				top: 50%;
+				left: 50%;
+				transform: translate( -50%, -50% );
+				padding: 12px 20px;
+				background: rgba( 0, 0, 0, 0.6 );
+				border-radius: 6px;
+				color: #cde;
+				font: 13px/1.4 monospace;
+				z-index: 60;
+				pointer-events: none;
+			}
+			#audioReadout .row { display: flex; gap: 8px; }
+			#audioReadout .lbl { width: 64px; color: #888; }
+			#audioReadout .val {
+				width: 44px;
+				text-align: right;
+				font-variant-numeric: tabular-nums;
+			}
+			#audioReadout.stale .val,
+			#audioReadout.stale .lbl { color: #555; }
+
+			#audioReadout .divider {
+				border-top: 1px solid #333;
+				margin: 4px 0;
+			}
+			#audioReadout .row.derived .lbl { color: #6cf; }
+			#audioReadout .row.derived .val { color: #cef; }
+			#audioReadout.stale .row.derived .lbl,
+			#audioReadout.stale .row.derived .val { color: #555; }
+
+			#bandToggles {
+				position: fixed;
+				bottom: 12px;
+				right: 12px;
+				background: rgba(0, 0, 0, 0.65);
+				color: #ddd;
+				font-family: monospace;
+				font-size: 11px;
+				padding: 8px 10px;
+				border-radius: 4px;
+				z-index: 100;
+				min-width: 220px;
+				user-select: none;
+			}
+			#bandToggles .header {
+				color: #888;
+				font-size: 9px;
+				text-transform: uppercase;
+				letter-spacing: 1px;
+				padding-bottom: 4px;
+				margin-bottom: 4px;
+				border-bottom: 1px solid #333;
+			}
+			#bandToggles .row {
+				display: flex;
+				align-items: center;
+				gap: 8px;
+				padding: 2px 0;
+			}
+			#bandToggles .row.disabled {
+				opacity: 0.35;
+			}
+			#bandToggles input[type="checkbox"] {
+				cursor: pointer;
+				margin: 0;
+				accent-color: #ff8844;
+			}
+			#bandToggles .row.disabled input { cursor: not-allowed; }
+			#bandToggles .name {
+				width: 64px;
+				font-weight: bold;
+				color: #ff8844;
+			}
+			#bandToggles .row.disabled .name { color: #666; }
+			#bandToggles .desc { color: #888; font-size: 10px; }
+</style>
+	</head>
+	<body>
+
+		
+		<script id="fragmentShaderPosition" type="x-shader/x-fragment">
+		// GPGPU: integrate velocity into position each frame.
+
+			uniform float time;
+			uniform float delta;
+
+			void main()	{
+
+				vec2 uv = gl_FragCoord.xy / resolution.xy;
+				vec4 tmpPos = texture2D( texturePosition, uv );
+				vec3 position = tmpPos.xyz;
+				vec3 velocity = texture2D( textureVelocity, uv ).xyz;
+
+				float phase = tmpPos.w;
+
+				phase = mod( ( phase + delta +
+					length( velocity.xz ) * delta * 3. +
+					max( velocity.y, 0.0 ) * delta * 6. ), 62.83 );
+
+				gl_FragColor = vec4( position + velocity * delta * 15. , phase );
+
+			}
+
+</script>
+
+		
+		<script id="fragmentShaderVelocity" type="x-shader/x-fragment">
+		// GPGPU: flocking + environment + audio forces, via spatial-hash neighbour search.
+
+			uniform float time;
+			uniform float testing;
+			uniform float delta;
+			uniform float separationDistance;
+			uniform float alignmentDistance;
+			uniform float cohesionDistance;
+			uniform float freedomFactor;
+
+			uniform float shockwaveStrength;
+			uniform float shockwaveSourceY;
+			uniform float shockwaveReach;
+
+			uniform sampler2D cellTexture;
+			uniform vec3 gridDim;
+			uniform vec3 cellSize;
+			uniform vec3 worldMin;
+			uniform float slotsPerCell;
+			uniform float posTexDim;
+			uniform vec2 cellTexDim;
+
+			uniform vec3 shapeCenter;
+			uniform float attractionStrength;
+			uniform vec3 drift;
+			uniform float minSpeed;
+
+			uniform float velocityDamping;
+
+			uniform float maxSpeed;
+
+			uniform float maxTurnRate;
+
+			uniform float shearStrength;
+
+			uniform float groundY;
+			uniform float groundRepelHeight;
+			uniform float groundRepelStrength;
+
+			uniform vec3 boxMin;
+			uniform vec3 boxMax;
+			uniform float boxRepelMargin;
+			uniform float boxRepelStrength;
+
+			uniform vec3 cameraPos;
+			uniform float cameraRepelRadius;
+			uniform float cameraRepelStrength;
+
+			#define MAX_SLOTS 16
+
+			const float width = resolution.x;
+			const float height = resolution.y;
+
+			const float PI = 3.141592653589793;
+			const float PI_2 = PI * 2.0;
+
+			float zoneRadius = 40.0;
+			float zoneRadiusSquared = 1600.0;
+
+			float separationThresh = 0.45;
+			float alignmentThresh = 0.65;
+
+			const float UPPER_BOUNDS = BOUNDS;
+			const float LOWER_BOUNDS = -UPPER_BOUNDS;
+
+			float rand( vec2 co ){
+				return fract( sin( dot( co.xy, vec2(12.9898,78.233) ) ) * 43758.5453 );
+			}
+
+			void main() {
+
+				zoneRadius = separationDistance + alignmentDistance + cohesionDistance;
+				separationThresh = separationDistance / zoneRadius;
+				alignmentThresh = ( separationDistance + alignmentDistance ) / zoneRadius;
+				zoneRadiusSquared = zoneRadius * zoneRadius;
+
+				vec2 uv = gl_FragCoord.xy / resolution.xy;
+				vec3 birdPosition, birdVelocity;
+
+				vec3 selfPosition = texture2D( texturePosition, uv ).xyz;
+				vec3 selfVelocity = texture2D( textureVelocity, uv ).xyz;
+
+				float dist;
+				vec3 dir;
+				float distSquared;
+
+				float separationSquared = separationDistance * separationDistance;
+				float cohesionSquared = cohesionDistance * cohesionDistance;
+
+				float f;
+				float percent;
+
+				vec3 velocity = selfVelocity;
+
+				float limit = maxSpeed;
+
+				if ( shockwaveStrength > 0.0 ) {
+
+					float heightAbove = selfPosition.y - shockwaveSourceY;
+					float falloff = clamp( 1.0 - heightAbove / shockwaveReach, 0.0, 1.0 );
+					float kick = falloff * shockwaveStrength * 100.0 * delta;
+					velocity.y += kick;
+					limit += 5.0 * shockwaveStrength * falloff;
+
+				}
+
+				// Snapshot heading before steering, for the turn-rate limit below.
+				vec3 preSteerVelocity = velocity;
+
+				vec3 toCenter = shapeCenter - selfPosition;
+				toCenter.y *= 2.5;
+				if ( length( toCenter ) > 0.0001 ) {
+					velocity += normalize( toCenter ) * delta * attractionStrength;
+				}
+
+				velocity += drift * delta;
+
+				vec3 myCell = clamp(
+					floor( ( selfPosition - worldMin ) / cellSize ),
+					vec3( 0.0 ),
+					gridDim - 1.0
+				);
+
+				// Visit this bird's cell and its 26 neighbours.
+				for ( int dx = -1; dx <= 1; dx++ ) {
+					for ( int dy = -1; dy <= 1; dy++ ) {
+						for ( int dz = -1; dz <= 1; dz++ ) {
+
+							vec3 nCell = myCell + vec3( float( dx ), float( dy ), float( dz ) );
+
+							if ( any( lessThan( nCell, vec3( 0.0 ) ) ) ) continue;
+							if ( any( greaterThanEqual( nCell, gridDim ) ) ) continue;
+
+							for ( int slot = 0; slot < MAX_SLOTS; slot++ ) {
+
+								float tx = nCell.x * slotsPerCell + float( slot );
+								float ty = nCell.y + nCell.z * gridDim.y;
+								vec2 cellUV = ( vec2( tx, ty ) + 0.5 ) / cellTexDim;
+
+								float birdIdx = texture2D( cellTexture, cellUV ).r;
+
+								if ( birdIdx < 0.0 ) break;
+
+								vec2 ref = (
+									vec2( mod( birdIdx, posTexDim ), floor( birdIdx / posTexDim ) ) + 0.5
+								) / posTexDim;
+
+								birdPosition = texture2D( texturePosition, ref ).xyz;
+
+								dir = birdPosition - selfPosition;
+								dist = length( dir );
+
+								if ( dist < 0.0001 ) continue;
+
+								distSquared = dist * dist;
+
+								if ( distSquared > zoneRadiusSquared ) continue;
+
+								percent = distSquared / zoneRadiusSquared;
+
+								if ( percent < separationThresh ) {
+
+									f = ( separationThresh / percent - 1.0 ) * delta;
+									vec3 sep = normalize( dir ) * f;
+
+									// Shear: extra separation along the travel axis -> flock stretches into filaments.
+									if ( shearStrength > 0.0 ) {
+										float svLen = length( selfVelocity );
+										if ( svLen > 0.0001 ) {
+											vec3 vAxis = selfVelocity / svLen;
+											float along = dot( dir / dist, vAxis );
+											sep += vAxis * ( along * f * shearStrength );
+										}
+									}
+									velocity -= sep;
+
+								} else if ( percent < alignmentThresh ) {
+
+									float threshDelta = alignmentThresh - separationThresh;
+									float adjustedPercent = ( percent - separationThresh ) / threshDelta;
+
+									birdVelocity = texture2D( textureVelocity, ref ).xyz;
+
+									f = ( 0.5 - cos( adjustedPercent * PI_2 ) * 0.5 + 0.5 ) * delta;
+									velocity += normalize( birdVelocity ) * f;
+
+								} else {
+
+									float threshDelta = 1.0 - alignmentThresh;
+									float adjustedPercent;
+									if( threshDelta == 0. ) adjustedPercent = 1.;
+									else adjustedPercent = ( percent - alignmentThresh ) / threshDelta;
+
+									f = ( 0.5 - ( cos( adjustedPercent * PI_2 ) * -0.5 + 0.5 ) ) * delta;
+
+									velocity += normalize( dir ) * f;
+
+								}
+
+							}
+
+						}
+					}
+				}
+
+				{
+					float rx = rand( uv + vec2( time * 0.013, 1.7 ) ) * 2.0 - 1.0;
+					float ry = rand( uv + vec2( time * 0.017, 3.1 ) ) * 2.0 - 1.0;
+					float rz = rand( uv + vec2( time * 0.011, 5.3 ) ) * 2.0 - 1.0;
+					velocity += vec3( rx, ry * 0.3, rz ) * delta * freedomFactor;
+				}
+
+				{
+					float preLen = length( preSteerVelocity );
+					float postLen = length( velocity );
+					if ( preLen > 0.0001 && postLen > 0.0001 ) {
+						vec3 oldDir = preSteerVelocity / preLen;
+						vec3 newDir = velocity / postLen;
+						float cosA = clamp( dot( oldDir, newDir ), -1.0, 1.0 );
+						float angle = acos( cosA );
+						float maxAngle = maxTurnRate * delta;
+						if ( angle > maxAngle ) {
+
+							vec3 perp = newDir - oldDir * cosA;
+							float perpLen = length( perp );
+							if ( perpLen > 0.00001 ) {
+								perp /= perpLen;
+								vec3 clampedDir = oldDir * cos( maxAngle ) + perp * sin( maxAngle );
+								velocity = clampedDir * postLen;
+							}
+						}
+					}
+				}
+
+				{
+					float aboveGround = selfPosition.y - groundY;
+					if ( aboveGround < groundRepelHeight ) {
+						float t = 1.0 - max( aboveGround, 0.0 ) / groundRepelHeight;
+						velocity.y += t * t * groundRepelStrength * delta;
+					}
+				}
+
+				{
+					vec3 fromMin = selfPosition - boxMin;
+					vec3 toMax   = boxMax - selfPosition;
+
+					if ( fromMin.x < boxRepelMargin ) {
+						float t = 1.0 - max( fromMin.x, 0.0 ) / boxRepelMargin;
+						velocity.x += t * t * boxRepelStrength * delta;
+					}
+					if ( toMax.x < boxRepelMargin ) {
+						float t = 1.0 - max( toMax.x, 0.0 ) / boxRepelMargin;
+						velocity.x -= t * t * boxRepelStrength * delta;
+					}
+					if ( fromMin.y < boxRepelMargin ) {
+						float t = 1.0 - max( fromMin.y, 0.0 ) / boxRepelMargin;
+						velocity.y += t * t * boxRepelStrength * delta;
+					}
+					if ( toMax.y < boxRepelMargin ) {
+						float t = 1.0 - max( toMax.y, 0.0 ) / boxRepelMargin;
+						velocity.y -= t * t * boxRepelStrength * delta;
+					}
+					if ( fromMin.z < boxRepelMargin ) {
+						float t = 1.0 - max( fromMin.z, 0.0 ) / boxRepelMargin;
+						velocity.z += t * t * boxRepelStrength * delta;
+					}
+					if ( toMax.z < boxRepelMargin ) {
+						float t = 1.0 - max( toMax.z, 0.0 ) / boxRepelMargin;
+						velocity.z -= t * t * boxRepelStrength * delta;
+					}
+				}
+
+				{
+					vec3 fromCamera = selfPosition - cameraPos;
+					float distFromCamera = length( fromCamera );
+					if ( distFromCamera < cameraRepelRadius && distFromCamera > 0.0001 ) {
+						float t = 1.0 - distFromCamera / cameraRepelRadius;
+						velocity += normalize( fromCamera ) * t * t * cameraRepelStrength * delta;
+					}
+				}
+
+				velocity *= velocityDamping;
+
+				float speed = length( velocity );
+				if ( speed < minSpeed && speed > 0.0001 ) {
+					velocity = velocity * ( minSpeed / speed );
+				}
+
+				if ( length( velocity ) > limit ) {
+					velocity = normalize( velocity ) * limit;
+				}
+
+				gl_FragColor = vec4( velocity, 1.0 );
+
+			}
+
+</script>
+
+		
+		<script id="cellBuilderFrag" type="x-shader/x-fragment">
+		// Builds the spatial-hash grid (bird indices per cell) for the velocity pass.
+
+			precision highp float;
+
+			uniform sampler2D positionTexture;
+			uniform vec3 gridDim;
+			uniform vec3 cellSize;
+			uniform vec3 worldMin;
+			uniform float slotsPerCell;
+			uniform float birdCount;
+			uniform float posTexDim;
+			uniform vec2 cellTexDim;
+
+			void main() {
+
+				vec2 texelCoord = floor( gl_FragCoord.xy );
+
+				float slot  = mod( texelCoord.x, slotsPerCell );
+				float cellX = floor( texelCoord.x / slotsPerCell );
+				float cellY = mod( texelCoord.y, gridDim.y );
+				float cellZ = floor( texelCoord.y / gridDim.y );
+				vec3 myCell = vec3( cellX, cellY, cellZ );
+
+				if ( cellX >= gridDim.x || cellZ >= gridDim.z ) {
+					gl_FragColor = vec4( -1.0, 0.0, 0.0, 1.0 );
+					return;
+				}
+
+				float matchCount = 0.0;
+				float result = -1.0;
+
+				for ( int i = 0; i < MAX_BIRDS; i++ ) {
+
+					if ( float( i ) >= birdCount ) break;
+					if ( result >= 0.0 ) break;
+
+					float fi = float( i );
+					vec2 birdUV = (
+						vec2( mod( fi, posTexDim ), floor( fi / posTexDim ) ) + 0.5
+					) / posTexDim;
+
+					vec3 birdPos = texture2D( positionTexture, birdUV ).xyz;
+					vec3 birdCell = clamp(
+						floor( ( birdPos - worldMin ) / cellSize ),
+						vec3( 0.0 ),
+						gridDim - 1.0
+					);
+
+					if ( all( equal( birdCell, myCell ) ) ) {
+						if ( matchCount == slot ) {
+							result = fi;
+						}
+						matchCount += 1.0;
+					}
+
+				}
+
+				gl_FragColor = vec4( result, 0.0, 0.0, 1.0 );
+
+			}
+
+</script>
+
+		<script type="x-shader/x-vertex" id="birdVS">
+		// Orients each 3-triangle bird along its velocity; wing flap scales with speed.
+
+			attribute vec2 reference;
+			attribute float birdVertex;
+
+			attribute vec3 birdColor;
+
+			uniform sampler2D texturePosition;
+			uniform sampler2D textureVelocity;
+
+			varying vec4 vColor;
+			varying float z;
+
+			uniform float time;
+
+			void main() {
+
+				vec4 tmpPos = texture2D( texturePosition, reference );
+				vec3 pos = tmpPos.xyz;
+				vec3 velocity = normalize(texture2D( textureVelocity, reference ).xyz);
+
+				vec3 newPosition = position;
+
+				if ( birdVertex == 4.0 || birdVertex == 7.0 ) {
+
+					newPosition.y = sin( tmpPos.w ) * 5.;
+				}
+
+				newPosition = mat3( modelMatrix ) * newPosition;
+
+				velocity.z *= -1.;
+				float xz = length( velocity.xz );
+				float xyz = 1.;
+				float x = sqrt( 1. - velocity.y * velocity.y );
+
+				float cosry = velocity.x / xz;
+				float sinry = velocity.z / xz;
+
+				float cosrz = x / xyz;
+				float sinrz = velocity.y / xyz;
+
+				mat3 maty =  mat3(
+					cosry, 0, -sinry,
+					0    , 1, 0     ,
+					sinry, 0, cosry
+
+				);
+
+				mat3 matz =  mat3(
+					cosrz , sinrz, 0,
+					-sinrz, cosrz, 0,
+					0     , 0    , 1
+				);
+
+				newPosition =  maty * matz * newPosition;
+				newPosition += pos;
+
+				z = newPosition.z;
+
+				vColor = vec4( birdColor, 1.0 );
+				gl_Position = projectionMatrix *  viewMatrix  * vec4( newPosition, 1.0 );
+			}
+
+</script>
+
+		
+		<script type="x-shader/x-fragment" id="birdFS">
+		// Depth shading x audio-driven cosine palette, plus per-bird shimmer.
+
+			varying vec4 vColor;
+			varying float z;
+
+			uniform vec3 color;
+
+			uniform float paletteEnabled;
+			uniform float paletteT;
+			uniform vec3  paletteA;
+			uniform vec3  paletteB;
+			uniform vec3  paletteC;
+			uniform vec3  paletteD;
+			uniform float paletteIntensity;
+
+			uniform float twinkleAmount;
+			uniform float time;
+
+			vec3 palette( float t, vec3 a, vec3 b, vec3 c, vec3 d ) {
+				return a + b * cos( 6.28318 * ( c * t + d ) );
+			}
+
+			void main() {
+
+				float z2 = 0.2 + ( 1000. - z ) / 1000. * vColor.x;
+				vec3 base = vec3( z2 );
+
+				vec3 paletteColor = palette( paletteT, paletteA, paletteB, paletteC, paletteD );
+				vec3 colored = base * paletteColor * paletteIntensity;
+				vec3 finalColor = mix( base, colored, paletteEnabled );
+
+				if ( twinkleAmount > 0.001 ) {
+					float twinkleSeed = vColor.x * 7.31 + vColor.y * 11.7;
+					float twinkle =
+						( sin( time * 0.020 + twinkleSeed * 6.28 ) * 0.5 + 0.5 ) *
+						( sin( time * 0.013 + twinkleSeed * 17.0 ) * 0.5 + 0.5 );
+					finalColor += vec3( twinkle * twinkleAmount );
+				}
+
+				gl_FragColor = vec4( finalColor, 1.0 );
+
+			}
+
+</script>
+
+		<script type="importmap">
+			{
+				"imports": {
+					"three": "../vendor/three/three.module.js",
+					"three/addons/": "../vendor/three/addons/"
+				}
+			}
+		</script>
+
+		<script type="module">
+
+			import * as THREE from 'three';
+
+			import Stats from 'three/addons/libs/stats.module.js';
+			import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+			import { GPUComputationRenderer } from 'three/addons/misc/GPUComputationRenderer.js';
+
+			import { AudioEngine } from '../audio-engine.js';
+
+			// ===== Config & constants =====
+			// ===== Bird count + GPU auto-scaling =====
+			// WIDTH/BIRDS are baked into shaders, geometry and the grid at init, so
+			// the count can't change mid-run without a full rebuild. Instead we pick
+			// a tier from a ladder and, on weaker GPUs, drop a tier and reload until
+			// the flock holds ~60fps. ?birds=N still overrides everything (manual).
+			const BIRD_LADDER = [ 12000, 8000, 5000, 3000, 1500 ]; // high -> low
+			const FPS_TARGET = 57;          // calibration: median fps below this -> drop a tier
+			const FPS_FLOOR = 50;           // in-session: sustained below this -> drop a tier
+			const CALIB_WARMUP_MS = 800;    // ignore first frames (shader compile / warmup)
+			const CALIB_PROBE_MS = 2500;    // then sample median fps over this window
+			const SAFETY_GRACE_MS = 12000;  // don't second-guess the tier for this long after load
+			const TIER_KEY = 'murmurTier';
+			const CALIB_KEY = 'murmurCalibrated';
+
+			let manualBirds = false;
+			let birdTier = 0;
+
+			function widthForCount( count ) {
+				return Math.max( 32, Math.ceil( Math.sqrt( count ) ) );
+			}
+
+			function detectStartTier() {
+				try {
+					const c = document.createElement( 'canvas' );
+					const gl = c.getContext( 'webgl2' ) || c.getContext( 'webgl' );
+					const dbg = gl && gl.getExtension( 'WEBGL_debug_renderer_info' );
+					const s = ( dbg ? String( gl.getParameter( dbg.UNMASKED_RENDERER_WEBGL ) ) : '' ).toLowerCase();
+					if ( /llvmpipe|swiftshader|software|microsoft basic/.test( s ) ) return BIRD_LADDER.length - 1;
+					if ( /intel|uhd graphics|iris/.test( s ) ) return 2;                          // integrated -> middle
+					if ( /nvidia|geforce|radeon|\brx\b|\bamd\b|arc|apple m/.test( s ) ) return 0; // discrete -> top
+				} catch ( e ) {}
+				return 1; // unknown -> one below top
+			}
+
+			function resolveWidth() {
+				const requested = parseInt( new URL( window.location.href ).searchParams.get( 'birds' ), 10 );
+				if ( Number.isFinite( requested ) && requested > 0 ) {
+					manualBirds = true;
+					return widthForCount( requested );
+				}
+				const stored = parseInt( localStorage.getItem( TIER_KEY ), 10 );
+				birdTier = Number.isFinite( stored )
+					? Math.min( BIRD_LADDER.length - 1, Math.max( 0, stored ) )
+					: detectStartTier();
+				return widthForCount( BIRD_LADDER[ birdTier ] );
+			}
+
+			const WIDTH = resolveWidth();
+
+			const BIRDS = WIDTH * WIDTH;
+
+			console.info( `[murmuration] WIDTH=${WIDTH}, BIRDS=${BIRDS}, tier=${ manualBirds ? 'manual' : birdTier }. Override with ?birds=N` );
+
+			// --- Calibration splash + fps-driven tier control ---
+			let calibSplashEl = null;
+			function showCalibSplash( text ) {
+				if ( ! calibSplashEl ) {
+					calibSplashEl = document.createElement( 'div' );
+					calibSplashEl.id = 'calibSplash';
+					( document.body || document.documentElement ).appendChild( calibSplashEl );
+				}
+				calibSplashEl.textContent = text;
+			}
+			function hideCalibSplash() {
+				if ( calibSplashEl ) { calibSplashEl.remove(); calibSplashEl = null; }
+			}
+
+			function median( arr ) {
+				if ( ! arr.length ) return 0;
+				const a = arr.slice().sort( ( x, y ) => x - y );
+				const m = a.length >> 1;
+				return a.length % 2 ? a[ m ] : ( a[ m - 1 ] + a[ m ] ) / 2;
+			}
+
+			const calibProbe = {
+				active: ! manualBirds && localStorage.getItem( CALIB_KEY ) !== '1',
+				startAt: 0,
+				samples: [],
+			};
+			const fpsMonitor = { samples: [] };
+
+			// Called every frame from render(). delta is seconds since last frame.
+			// The sim keeps rendering underneath; we only measure and (rarely) reload.
+			function calibrationTick( now, delta ) {
+
+				const fps = delta > 0 ? 1 / delta : 0;
+
+				if ( calibProbe.active ) {
+					if ( calibProbe.startAt === 0 ) {
+						calibProbe.startAt = now;
+						showCalibSplash( 'Calibrating…' );
+						return;
+					}
+					const elapsed = now - calibProbe.startAt;
+					if ( elapsed < CALIB_WARMUP_MS ) return;
+					if ( fps > 0 ) calibProbe.samples.push( fps );
+					if ( elapsed < CALIB_WARMUP_MS + CALIB_PROBE_MS ) return;
+
+					calibProbe.active = false;
+					const med = median( calibProbe.samples );
+					if ( med < FPS_TARGET && birdTier < BIRD_LADDER.length - 1 ) {
+						localStorage.setItem( TIER_KEY, String( birdTier + 1 ) );
+						showCalibSplash( 'Calibrating… reducing flock for 60fps' );
+						location.reload();
+						return;
+					}
+					localStorage.setItem( TIER_KEY, String( birdTier ) );
+					localStorage.setItem( CALIB_KEY, '1' );
+					console.info( `[murmuration] calibrated: tier ${birdTier} (~${med.toFixed( 0 )}fps median)` );
+					hideCalibSplash();
+					return;
+				}
+
+				// In-session safety net: if a song genuinely overloads the GPU after
+				// calibration, step down one tier once (the reload then re-probes).
+				// Only ever reduces; guarded by a grace period so it never thrashes.
+				if ( manualBirds || birdTier >= BIRD_LADDER.length - 1 ) return;
+				if ( now < SAFETY_GRACE_MS ) return;
+				if ( fps > 0 ) fpsMonitor.samples.push( fps );
+				if ( fpsMonitor.samples.length > 300 ) fpsMonitor.samples.shift();
+				if ( fpsMonitor.samples.length < 300 ) return;
+				if ( median( fpsMonitor.samples ) < FPS_FLOOR ) {
+					localStorage.setItem( TIER_KEY, String( birdTier + 1 ) );
+					localStorage.removeItem( CALIB_KEY );
+					showCalibSplash( 'Adjusting flock size for 60fps…' );
+					location.reload();
+				}
+
+			}
+
+			class BirdGeometry extends THREE.BufferGeometry {
+
+				constructor() {
+
+					super();
+
+					const trianglesPerBird = 3;
+					const triangles = BIRDS * trianglesPerBird;
+					const points = triangles * 3;
+
+					const vertices = new THREE.BufferAttribute( new Float32Array( points * 3 ), 3 );
+					const birdColors = new THREE.BufferAttribute( new Float32Array( points * 3 ), 3 );
+					const references = new THREE.BufferAttribute( new Float32Array( points * 2 ), 2 );
+					const birdVertex = new THREE.BufferAttribute( new Float32Array( points ), 1 );
+
+					this.setAttribute( 'position', vertices );
+					this.setAttribute( 'birdColor', birdColors );
+					this.setAttribute( 'reference', references );
+					this.setAttribute( 'birdVertex', birdVertex );
+
+					let v = 0;
+
+					function verts_push() {
+
+						for ( let i = 0; i < arguments.length; i ++ ) {
+
+							vertices.array[ v ++ ] = arguments[ i ];
+
+						}
+
+					}
+
+					const wingsSpan = 20;
+
+					for ( let f = 0; f < BIRDS; f ++ ) {
+
+						verts_push(
+							0, - 0, - 20,
+							0, 4, - 20,
+							0, 0, 30
+						);
+
+						verts_push(
+							0, 0, - 15,
+							- wingsSpan, 0, 0,
+							0, 0, 15
+						);
+
+						verts_push(
+							0, 0, 15,
+							wingsSpan, 0, 0,
+							0, 0, - 15
+						);
+
+					}
+
+					for ( let v = 0; v < triangles * 3; v ++ ) {
+
+						const triangleIndex = ~ ~ ( v / 3 );
+						const birdIndex = ~ ~ ( triangleIndex / trianglesPerBird );
+						const x = ( birdIndex % WIDTH ) / WIDTH;
+						const y = ~ ~ ( birdIndex / WIDTH ) / WIDTH;
+
+						const t = birdIndex / BIRDS;
+						const seed = ( birdIndex * 9301 + 49297 ) % 233280 / 233280;
+						const jitter = ( seed - 0.5 ) * 0.08;
+						const cr = 0.18 + t * 0.22 + jitter;
+						const cg = 0.20 + t * 0.22 + jitter;
+						const cb = 0.26 + t * 0.24 + jitter * 0.5;
+						const c = new THREE.Color( cr, cg, cb );
+
+						birdColors.array[ v * 3 + 0 ] = c.r;
+						birdColors.array[ v * 3 + 1 ] = c.g;
+						birdColors.array[ v * 3 + 2 ] = c.b;
+
+						references.array[ v * 2 ] = x;
+						references.array[ v * 2 + 1 ] = y;
+
+						birdVertex.array[ v ] = v % 9;
+
+					}
+
+					this.scale( 0.2, 0.2, 0.2 );
+
+				}
+
+			}
+
+			let container, stats;
+			let camera, scene, renderer;
+			let gui;
+			let groundMat;
+
+			// Apply a background preset live: sky colour, matched fog colour, and ground colour.
+			function setBackground( name ) {
+				const preset = BACKGROUND_PRESETS[ name ];
+				if ( ! preset || ! scene ) return;
+				const sky = new THREE.Color( preset.sky );
+				scene.background = sky;
+				if ( scene.fog ) scene.fog.color.copy( sky );
+				if ( groundMat ) groundMat.color.set( preset.ground );
+			}
+
+			const effectController = {
+				separation: 14.0,
+				alignment: 35.0,
+				cohesion: 44.375,
+				freedom: 0.6,
+				attractionStrength: 1.9,
+				driftX: 0.1,
+				driftZ: 0.0,
+				minSpeed: 2.7,
+				maxSpeed: 9.0,
+				velocityDamping: 0.98,
+				groundRepelStrength: 25,
+				boxRepelStrength: 9,
+				cameraRepelStrength: 60
+			};
+
+			const BOUNDS = 800, BOUNDS_HALF = BOUNDS / 2;
+
+			const GRID_X = 16, GRID_Y = 8, GRID_Z = 16;
+			const SLOTS_PER_CELL = 16;
+			const CELL_TEX_W = GRID_X * SLOTS_PER_CELL;
+			const CELL_TEX_H = GRID_Y * GRID_Z;
+
+			const FLOCK_EXTENT = new THREE.Vector3( 800, 1300, 800 );
+			const CELL_SIZE = new THREE.Vector3(
+				FLOCK_EXTENT.x * 2 / GRID_X,
+				FLOCK_EXTENT.y * 2 / GRID_Y,
+				FLOCK_EXTENT.z * 2 / GRID_Z
+			);
+			const WORLD_MIN = new THREE.Vector3( -FLOCK_EXTENT.x, -FLOCK_EXTENT.y, -FLOCK_EXTENT.z );
+
+			let last = performance.now();
+
+			let gpuCompute;
+			let velocityVariable;
+			let positionVariable;
+			let positionUniforms;
+			let velocityUniforms;
+			let birdUniforms;
+
+			let cellRT;
+			let cellBuilderMat;
+			let cellBuilderScene, cellBuilderCamera;
+
+			const GROUND_Y = -300;
+			const GROUND_REPEL_HEIGHT = 120;
+			const GROUND_REPEL_STRENGTH = 25;
+
+			const BOX_MIN = new THREE.Vector3( -770, -250, -770 );
+			const BOX_MAX = new THREE.Vector3(  770, 1250,  770 );
+			const BOX_REPEL_MARGIN = 80;
+			const BOX_REPEL_STRENGTH = 9;
+
+			const CAMERA_REPEL_RADIUS = 700;
+			const CAMERA_REPEL_STRENGTH = 60;
+
+			const ORBIT_DEFAULT = false;
+			const ORBIT_PERIOD = 90.0;
+			const ORBIT_RADIUS = 1700;
+			const ORBIT_HEIGHT = 100;
+
+			const cameraSettings = { orbitEnabled: ORBIT_DEFAULT, povHeight: -300, fov: 18, camDistance: 3500 };
+
+			let uiVisible = true;
+			const orbitStart = performance.now();
+
+			const AUDIO_STALE_MS = 500;
+			const audioSettings = { showReadout: true };
+			const audioState = {
+				connected: false,
+				lastMessageAt: 0,
+				lastSignalAt: 0,
+				amp: 0,
+				bands: {
+					subBass: 0, bass: 0, lowMid: 0, mid: 0,
+					upperMid: 0, treble: 0, air: 0
+				},
+
+				onsets: {
+					subBass: false, bass: false, lowMid: false, mid: false,
+					upperMid: false, treble: false, air: false
+				},
+				onsetEnvelopes: {
+					subBass: 0, bass: 0, lowMid: 0, mid: 0,
+					upperMid: 0, treble: 0, air: 0
+				}
+			};
+			let audioReadoutEls = null;
+			let bandTogglesEl = null;
+
+			// ===== Audio -> boid parameter mapping (per band) =====
+			const audioMapping = {
+			// Each band lerps a uniform between a floor (band quiet) and ceiling (band loud).
+				enabled: true,
+				subBassAttack: 0.5,
+				subBassRelease: 0.05,
+				separationSmoothing: 0.03,
+				attractFloor: 0.8,
+				attractCeiling: 3.0,
+				separationFloor: 14.0,
+				separationCeiling: 18.0,
+
+				trebleAttack: 0.4,
+				trebleRelease: 0.15,
+				maxSpeedFloor: 9.0,
+				maxSpeedCeiling: 16.0,
+
+				spikeThreshold: 0.33,
+				spikeGain: 0.8,
+				spikeDecay: 0.94,
+				shockwaveSourceY: -200.0,
+				shockwaveReach: 250.0,
+
+				verticalLift: 80.0,
+
+				freedomEnabled: true,
+				freedomFloor: 0.3,
+				freedomCeiling: 1.3,
+
+				shockwaveEnabled: false,
+
+				midSmoothing: 0.05,
+				alignmentFloor: 25.0,
+				alignmentCeiling: 38.0,
+
+				lowMidSmoothing: 0.05,
+				cohesionFloor: 35.0,
+				cohesionCeiling: 80.0,
+
+				airSmoothing: 0.1,
+				twinkleStrength: 0.20,
+				twinkleInvert: true,
+
+				twinkleEnabled: false,
+
+				upperMidAttack: 0.5,
+				upperMidRelease: 0.08,
+				upperMidGate: 0.08,
+				upperMidCurve: 1.6,
+
+				turnRateEnabled: true,
+				turnFloor: 5.0,
+				turnCeiling: 18.0,
+
+				shearEnabled: true,
+				shearFloor: 0.0,
+				shearCeiling: 1.2,
+
+				upperMidSpeedEnabled: false, // off by default in the Windows build (control stays visible)
+				upperMidSpeedFactor: 0.5,
+
+				bandEnabled: {
+					subBass:  true,
+					bass:     true,
+					lowMid:   true,
+					mid:      true,
+					upperMid: true,
+					treble:   true,
+					air:      true
+				}
+			};
+
+			const BAND_EFFECT_MAPPINGS = {
+				subBass:  'attract / sep / freedom / lift',
+				bass:     'palette pulse (dark-trough)',
+				lowMid:   'cohesion',
+				mid:      'alignment',
+				upperMid: 'turn-rate + shear + speed (solo)',
+				treble:   'maxSpeed',
+				air:      'shimmer'
+			};
+			const BAND_ORDER = [ 'subBass', 'bass', 'lowMid', 'mid', 'upperMid', 'treble', 'air' ];
+
+			const audioSmoothed = {
+				bass: 0,
+				bassOnsetForColour: 0,
+				subBass: 0,
+				subBassForSep: 0,
+				treble: 0,
+				mid: 0,
+				lowMid: 0,
+				upperMid: 0,
+				air: 0,
+				drivenAttract: 0,
+				drivenSeparation: 0,
+				drivenMaxSpeed: 0,
+				drivenFreedom: 0,
+				drivenAlignment: 0,
+				drivenCohesion: 0,
+				drivenTurnRate: 0,
+				drivenShear: 0,
+				drivenTwinkle: 0,
+				shockwaveEnvelope: 0,
+				drivenShapeY: 0
+			};
+
+			// ===== Colour: audio-driven cosine palette =====
+			const PALETTE_PRESETS = {
+				sunset:   { a:[0.5, 0.5, 0.5], b:[0.5, 0.5, 0.5], c:[1.0, 0.7, 0.4], d:[0.0, 0.15, 0.20] },
+				fire:     { a:[0.5, 0.5, 0.5], b:[0.5, 0.5, 0.5], c:[1.0, 1.0, 0.5], d:[0.8, 0.9,  0.30] },
+				rose:     { a:[0.8, 0.5, 0.4], b:[0.2, 0.4, 0.2], c:[2.0, 1.0, 1.0], d:[0.0, 0.25, 0.25] },
+				ocean:    { a:[0.0, 0.5, 0.5], b:[0.0, 0.5, 0.5], c:[0.0, 0.5, 0.333], d:[0.0, 0.5, 0.667] },
+				spectrum: { a:[0.5, 0.5, 0.5], b:[0.5, 0.5, 0.5], c:[1.0, 1.0, 1.0], d:[0.0, 0.33, 0.67] }
+			};
+
+			const colorMapping = {
+				enabled: true,
+				palette: 'ocean',
+
+				tScale: 0.45,
+				tOffset: 0.11,
+				onsetBoost: 0.05,
+				onsetSmoothing: 0.12,
+
+				intensity: 0.65
+			};
+
+			// ===== Background: deep-twilight presets (sky + matched fog + ground) =====
+			// Same restrained dark-palette language as the bird colours — all kept dark so the
+			// near-black trough silhouettes stay readable and the cyan ignite still pops. Each
+			// ground is a few stops below its sky so it reads as "below" without standing out.
+			const BACKGROUND_PRESETS = {
+				twilight: { sky: 0x0a1428, ground: 0x040912 }, // original default
+				midnight: { sky: 0x05080f, ground: 0x010205 }, // near-black blue — max bird contrast
+				violet:   { sky: 0x140a28, ground: 0x09040f }, // deep purple dusk
+				teal:     { sky: 0x081a1a, ground: 0x030a0a }, // dark teal — pairs with ocean palette
+				ember:    { sky: 0x140a08, ground: 0x080403 }, // warm charcoal / dim ember
+				// Brighter / daytime skies — dark trough silhouettes pop hard against these,
+				// like real murmuration footage shot against a pale sky. Cyan ignite softens a bit.
+				dusk:     { sky: 0x3a4a6a, ground: 0x1c2436 }, // lighter blue-grey dusk
+				overcast: { sky: 0xb8c0c8, ground: 0x6b7178 }, // pale neutral grey — classic footage look
+				dawn:     { sky: 0xd8c4b2, ground: 0x8a7d70 }, // warm pale dawn
+				steel:    { sky: 0x9fb4c8, ground: 0x5e6e7c }, // light steel blue
+				mist:     { sky: 0xcdd6dd, ground: 0x7a828a }  // bright cool mist
+			};
+
+			const backgroundMapping = {
+				preset: 'twilight'
+			};
+
+			// ===== Dev UI: readout panel, band toggles, dat.GUI =====
+			function createAudioReadoutPanel() {
+
+				const root = document.createElement( 'div' );
+				root.id = 'audioReadout';
+
+				const header = document.createElement( 'div' );
+				header.className = 'header';
+				const status = document.createElement( 'span' );
+				status.className = 'status disconnected';
+				header.appendChild( status );
+				const headerText = document.createTextNode( 'audio feeder · ONSETS' );
+				header.appendChild( headerText );
+				root.appendChild( header );
+
+				const valueEls = {};
+				function addRow( key, label, derived ) {
+					const row = document.createElement( 'div' );
+					row.className = derived ? 'row derived' : 'row';
+					const lbl = document.createElement( 'span' );
+					lbl.className = 'lbl';
+					lbl.textContent = label;
+					const val = document.createElement( 'span' );
+					val.className = 'val';
+					val.textContent = '—';
+					row.appendChild( lbl );
+					row.appendChild( val );
+					root.appendChild( row );
+					valueEls[ key ] = val;
+				}
+
+				addRow( 'amp', 'amp' );
+				addRow( 'subBass', 'subBass' );
+				addRow( 'bass', 'bass' );
+				addRow( 'lowMid', 'lowMid' );
+				addRow( 'mid', 'mid' );
+				addRow( 'upperMid', 'upperMid' );
+				addRow( 'treble', 'treble' );
+				addRow( 'air', 'air' );
+
+				const divider = document.createElement( 'div' );
+				divider.className = 'divider';
+				root.appendChild( divider );
+				addRow( 'bassSmoothed', 'bass(s)', true );
+				addRow( 'subBassSmoothed', 'subB(s)', true );
+				addRow( 'subBassSlow', 'subB(sl)', true );
+				addRow( 'trebleSmoothed', 'treble(s)', true );
+				addRow( 'drivenAttract', '→attract', true );
+				addRow( 'drivenSeparation', '→separate', true );
+				addRow( 'drivenAlignment', '→align', true );
+				addRow( 'drivenCohesion', '→cohesion', true );
+				addRow( 'drivenMaxSpeed', '→maxSpd', true );
+				addRow( 'drivenTurnRate', '→turnR', true );
+				addRow( 'drivenShear', '→shear', true );
+				addRow( 'drivenFreedom', '→freedom', true );
+				addRow( 'drivenTwinkle', '→twinkle', true );
+				addRow( 'drivenShockwave', '→spike', true );
+				addRow( 'drivenShapeY', '→shapeY', true );
+
+				document.body.appendChild( root );
+
+				audioReadoutEls = { root, status, values: valueEls };
+				updateAudioReadoutVisibility();
+
+			}
+
+			function updateAudioReadoutVisibility() {
+
+				if ( ! audioReadoutEls ) return;
+
+				const visible = uiVisible && audioSettings.showReadout;
+				audioReadoutEls.root.style.display = visible ? '' : 'none';
+
+			}
+
+			function createBandTogglesPanel() {
+
+				const root = document.createElement( 'div' );
+				root.id = 'bandToggles';
+
+				const header = document.createElement( 'div' );
+				header.className = 'header';
+				header.textContent = 'band → effect';
+				root.appendChild( header );
+
+				for ( const band of BAND_ORDER ) {
+
+					const desc = BAND_EFFECT_MAPPINGS[ band ];
+					const wired = desc !== null;
+
+					const row = document.createElement( 'div' );
+					row.className = 'row' + ( wired ? '' : ' disabled' );
+
+					const checkbox = document.createElement( 'input' );
+					checkbox.type = 'checkbox';
+					checkbox.checked = audioMapping.bandEnabled[ band ];
+					checkbox.disabled = ! wired;
+					checkbox.addEventListener( 'change', () => {
+						audioMapping.bandEnabled[ band ] = checkbox.checked;
+					} );
+
+					const nameEl = document.createElement( 'span' );
+					nameEl.className = 'name';
+					nameEl.textContent = band;
+
+					const descEl = document.createElement( 'span' );
+					descEl.className = 'desc';
+					descEl.textContent = wired ? desc : '(unwired)';
+
+					row.appendChild( checkbox );
+					row.appendChild( nameEl );
+					row.appendChild( descEl );
+					root.appendChild( row );
+
+				}
+
+				document.body.appendChild( root );
+				bandTogglesEl = root;
+
+			}
+
+			function updateBandTogglesVisibility() {
+
+				if ( ! bandTogglesEl ) return;
+				bandTogglesEl.style.display = uiVisible ? '' : 'none';
+
+			}
+
+			function updateUIVisibility() {
+
+				const display = uiVisible ? '' : 'none';
+				if ( typeof gui !== 'undefined' && gui && gui.domElement ) {
+					gui.domElement.style.display = display;
+				}
+				if ( typeof stats !== 'undefined' && stats && stats.dom ) {
+					stats.dom.style.display = display;
+				}
+				updateAudioReadoutVisibility();
+				updateBandTogglesVisibility();
+
+			}
+
+			// ===== In-app audio engine (Windows system-audio loopback) =====
+			// Replaces the Python feeder + websocket. AudioEngine captures the
+			// loopback stream and runs the exact feeder.py DSP in-process,
+			// producing the same { amp, bands, onsets, onset_envelopes } shape.
+			const SIGNAL_FLOOR = 1e-4;     // raw RMS below this = effectively silent
+			const NO_SIGNAL_MS = 2500;     // sustained silence before flagging "no signal"
+			let audioEngine = null;
+
+			function applyAudioFrame( msg ) {
+
+				if ( typeof msg.amp === 'number' ) audioState.amp = msg.amp;
+				if ( msg.bands ) {
+					for ( const k in audioState.bands ) {
+						if ( typeof msg.bands[ k ] === 'number' ) audioState.bands[ k ] = msg.bands[ k ];
+					}
+				}
+				if ( msg.onsets ) {
+					for ( const k in audioState.onsets ) {
+						if ( typeof msg.onsets[ k ] === 'boolean' ) audioState.onsets[ k ] = msg.onsets[ k ];
+					}
+				}
+				if ( msg.onset_envelopes ) {
+					for ( const k in audioState.onsetEnvelopes ) {
+						if ( typeof msg.onset_envelopes[ k ] === 'number' ) audioState.onsetEnvelopes[ k ] = msg.onset_envelopes[ k ];
+					}
+				}
+
+				const now = performance.now();
+				audioState.lastMessageAt = now;
+				audioState.connected = true;
+				// rawAmp is the pre-AGC RMS. AGC-normalised amp/bands can't tell a
+				// dead/silent/wrong loopback from quiet music — both get lifted —
+				// but the raw RMS can. Only a real signal refreshes lastSignalAt,
+				// which gates the green "connected" status (vs amber "no signal").
+				if ( typeof msg.rawAmp === 'number' && msg.rawAmp > SIGNAL_FLOOR ) {
+					audioState.lastSignalAt = now;
+				}
+
+			}
+
+			async function startAudioEngine() {
+
+				if ( audioEngine ) return;
+
+				let stream;
+				try {
+					// getDisplayMedia is satisfied by main.js's loopback handler.
+					stream = await navigator.mediaDevices.getDisplayMedia( { audio: true, video: true } );
+				} catch ( err ) {
+					console.warn( '[murmuration] loopback capture needs a click to start:', err );
+					setAudioBanner( 'start' );
+					return;
+				}
+
+				// A video track is required by the API; discard it, keep system audio.
+				for ( const t of stream.getVideoTracks() ) t.stop();
+				const audioOnly = new MediaStream( stream.getAudioTracks() );
+
+				audioEngine = new AudioEngine( {
+					workletUrl: '../capture-worklet.js',
+					onFrame: applyAudioFrame,
+				} );
+
+				try {
+					await audioEngine.start( audioOnly );
+					setAudioBanner( null );
+					console.info( '[murmuration] audio engine running (system loopback @ 44100Hz)' );
+				} catch ( err ) {
+					console.error( '[murmuration] audio engine failed to start:', err );
+					audioEngine = null;
+					setAudioBanner( 'start' );
+				}
+
+			}
+
+			// Centred banner for the two states the status dot can't convey when
+			// the readout is hidden: capture needs a click, or audio is running
+			// but silent (dead loopback / nothing playing / wrong device).
+			let audioBannerEl = null;
+			let audioBannerMode = null;
+			function setAudioBanner( mode ) {
+
+				if ( mode === audioBannerMode ) return;
+				audioBannerMode = mode;
+
+				if ( ! mode ) {
+					if ( audioBannerEl ) { audioBannerEl.remove(); audioBannerEl = null; }
+					return;
+				}
+
+				if ( ! audioBannerEl ) {
+					audioBannerEl = document.createElement( 'div' );
+					audioBannerEl.id = 'audioBanner';
+					audioBannerEl.addEventListener( 'click', () => startAudioEngine() );
+					document.body.appendChild( audioBannerEl );
+				}
+
+				audioBannerEl.classList.toggle( 'clickable', mode === 'start' );
+				audioBannerEl.textContent = ( mode === 'start' )
+					? 'Click to start — capturing system audio'
+					: 'No system audio detected — is something playing?';
+
+			}
+
+			// Drives the status dot (when the readout is shown) and the banner
+			// (always). Runs every frame from render(). Three states:
+			//   green  — engine running + live signal
+			//   amber  — engine running but silent for NO_SIGNAL_MS
+			//   red    — engine not running / frames stale
+			function updateAudioStatus( now ) {
+
+				const running = audioEngine && ( now - audioState.lastMessageAt ) < AUDIO_STALE_MS;
+				const signal = ( now - audioState.lastSignalAt ) < NO_SIGNAL_MS;
+				const state = ! running ? 'disconnected' : ( signal ? 'connected' : 'nosignal' );
+
+				if ( audioReadoutEls && audioSettings.showReadout ) {
+					audioReadoutEls.status.className = 'status ' + state;
+					audioReadoutEls.root.classList.toggle( 'stale', ! running );
+				}
+
+				// Banner: leave the click-to-start prompt up until the engine runs;
+				// once running, show the silence warning only while silent.
+				if ( ! audioEngine ) {
+					// keep whatever start-prompt state startAudioEngine set
+				} else if ( ! running || signal ) {
+					setAudioBanner( null );
+				} else {
+					setAudioBanner( 'nosignal' );
+				}
+
+			}
+
+			function updateAudioReadout( now ) {
+
+				if ( ! audioReadoutEls || ! audioSettings.showReadout ) return;
+
+				// Status dot + stale class are set by updateAudioStatus() (3-state).
+				const v = audioReadoutEls.values;
+				v.amp.textContent      = audioState.amp.toFixed( 2 );
+				v.subBass.textContent  = audioState.bands.subBass.toFixed( 2 );
+				v.bass.textContent     = audioState.bands.bass.toFixed( 2 );
+				v.lowMid.textContent   = audioState.bands.lowMid.toFixed( 2 );
+				v.mid.textContent      = audioState.bands.mid.toFixed( 2 );
+				v.upperMid.textContent = audioState.bands.upperMid.toFixed( 2 );
+				v.treble.textContent   = audioState.bands.treble.toFixed( 2 );
+				v.air.textContent      = audioState.bands.air.toFixed( 2 );
+
+				v.bassSmoothed.textContent     = audioSmoothed.bass.toFixed( 2 );
+				v.subBassSmoothed.textContent  = audioSmoothed.subBass.toFixed( 2 );
+				v.subBassSlow.textContent      = audioSmoothed.subBassForSep.toFixed( 2 );
+				v.trebleSmoothed.textContent   = audioSmoothed.treble.toFixed( 2 );
+				v.drivenAttract.textContent    = audioSmoothed.drivenAttract.toFixed( 2 );
+				v.drivenSeparation.textContent = audioSmoothed.drivenSeparation.toFixed( 2 );
+				v.drivenAlignment.textContent  = audioSmoothed.drivenAlignment.toFixed( 1 );
+				v.drivenCohesion.textContent   = audioSmoothed.drivenCohesion.toFixed( 1 );
+				v.drivenMaxSpeed.textContent   = audioSmoothed.drivenMaxSpeed.toFixed( 2 );
+
+				v.drivenTurnRate.textContent   = audioSmoothed.drivenTurnRate >= 999 ? 'off' : audioSmoothed.drivenTurnRate.toFixed( 1 );
+				v.drivenShear.textContent      = audioSmoothed.drivenShear.toFixed( 2 );
+				v.drivenFreedom.textContent    = audioSmoothed.drivenFreedom.toFixed( 2 );
+				v.drivenTwinkle.textContent    = audioSmoothed.drivenTwinkle.toFixed( 2 );
+				v.drivenShockwave.textContent  = audioSmoothed.shockwaveEnvelope.toFixed( 2 );
+				v.drivenShapeY.textContent     = audioSmoothed.drivenShapeY.toFixed( 0 );
+
+			}
+
+			init();
+
+			// ===== Scene, camera, renderer setup =====
+			function init() {
+
+				container = document.createElement( 'div' );
+				document.body.appendChild( container );
+
+				camera = new THREE.PerspectiveCamera( cameraSettings.fov, window.innerWidth / window.innerHeight, 1, 5000 );
+
+				camera.position.set( 0, 100, 1700 );
+				camera.lookAt( 0, 250, 0 );
+
+				scene = new THREE.Scene();
+
+				const bg = BACKGROUND_PRESETS[ backgroundMapping.preset ];
+				const skyColor = new THREE.Color( bg.sky );
+				scene.background = skyColor;
+
+				scene.fog = new THREE.Fog( skyColor, 600, 3500 );
+
+				const groundColor = new THREE.Color( bg.ground );
+				groundMat = new THREE.MeshBasicMaterial( {
+					color: groundColor,
+					fog: true
+				} );
+				const groundMesh = new THREE.Mesh(
+					new THREE.PlaneGeometry( 8000, 8000 ),
+					groundMat
+				);
+				groundMesh.rotation.x = -Math.PI / 2;
+				groundMesh.position.y = GROUND_Y;
+				scene.add( groundMesh );
+
+				renderer = new THREE.WebGLRenderer();
+
+				renderer.setPixelRatio( Math.min( window.devicePixelRatio, 2.0 ) );
+				renderer.setSize( window.innerWidth, window.innerHeight );
+				renderer.setAnimationLoop( animate );
+				container.appendChild( renderer.domElement );
+
+				initComputeRenderer();
+
+				stats = new Stats();
+				container.appendChild( stats.dom );
+
+				container.style.touchAction = 'none';
+
+				window.addEventListener( 'resize', onWindowResize );
+
+				window.addEventListener( 'keydown', ( ev ) => {
+					if ( ev.key === 'h' || ev.key === 'H' ) {
+						uiVisible = ! uiVisible;
+						updateUIVisibility();
+					}
+				} );
+
+				gui = new GUI();
+
+				const valuesChanger = function () {
+
+					velocityUniforms[ 'separationDistance' ].value = effectController.separation;
+					velocityUniforms[ 'alignmentDistance' ].value = effectController.alignment;
+					velocityUniforms[ 'cohesionDistance' ].value = effectController.cohesion;
+					velocityUniforms[ 'freedomFactor' ].value = effectController.freedom;
+					velocityUniforms[ 'attractionStrength' ].value = effectController.attractionStrength;
+					velocityUniforms[ 'drift' ].value.set( effectController.driftX, 0, effectController.driftZ );
+					velocityUniforms[ 'minSpeed' ].value = effectController.minSpeed;
+					velocityUniforms[ 'maxSpeed' ].value = effectController.maxSpeed;
+					velocityUniforms[ 'velocityDamping' ].value = effectController.velocityDamping;
+					velocityUniforms[ 'groundRepelStrength' ].value = effectController.groundRepelStrength;
+					velocityUniforms[ 'boxRepelStrength' ].value = effectController.boxRepelStrength;
+					velocityUniforms[ 'cameraRepelStrength' ].value = effectController.cameraRepelStrength;
+
+				};
+
+				valuesChanger();
+
+				const flockingFolder = gui.addFolder( 'flocking forces' );
+				flockingFolder.add( effectController, 'separation', 0.0, 100.0, 1.0 ).onChange( valuesChanger );
+				flockingFolder.add( effectController, 'alignment', 0.0, 100, 0.001 ).onChange( valuesChanger );
+				flockingFolder.add( effectController, 'cohesion', 0.0, 100, 0.025 ).onChange( valuesChanger );
+
+				flockingFolder.add( effectController, 'freedom', 0.0, 3.0, 0.05 ).onChange( valuesChanger );
+
+				flockingFolder.add( effectController, 'attractionStrength', 0.0, 5.0, 0.05 ).onChange( valuesChanger );
+
+				flockingFolder.add( effectController, 'driftX', -2.0, 2.0, 0.05 ).onChange( valuesChanger );
+				flockingFolder.add( effectController, 'driftZ', -2.0, 2.0, 0.05 ).onChange( valuesChanger );
+
+				flockingFolder.add( effectController, 'minSpeed', 0.0, 8.0, 0.1 ).onChange( valuesChanger );
+
+				flockingFolder.add( effectController, 'maxSpeed', 4.0, 25.0, 0.5 ).onChange( valuesChanger );
+
+				flockingFolder.add( effectController, 'velocityDamping', 0.95, 1.0, 0.001 ).onChange( valuesChanger );
+
+				flockingFolder.add( effectController, 'groundRepelStrength', 0.0, 80.0, 1.0 ).onChange( valuesChanger );
+
+				flockingFolder.add( effectController, 'boxRepelStrength', 0.0, 120.0, 1.0 ).onChange( valuesChanger );
+
+				flockingFolder.add( effectController, 'cameraRepelStrength', 0.0, 200.0, 1.0 ).onChange( valuesChanger );
+				flockingFolder.close();
+
+				const cameraFolder = gui.addFolder( 'camera' );
+
+				cameraFolder.add( cameraSettings, 'orbitEnabled' ).name( 'orbit (DEV)' );
+
+				cameraFolder.add( cameraSettings, 'povHeight', -300, 800, 5 ).name( 'POV height' );
+
+				cameraFolder.add( cameraSettings, 'camDistance', 500, 6000, 25 ).name( 'cam distance' );
+
+				cameraFolder.add( cameraSettings, 'fov', 8, 120, 1 ).name( 'FOV' ).onChange( () => {
+					camera.fov = cameraSettings.fov;
+					camera.updateProjectionMatrix();
+				} );
+				cameraFolder.close();
+
+				gui.add( {
+					hide: () => { uiVisible = false; updateUIVisibility(); }
+				}, 'hide' ).name( 'hide UI (press H)' );
+
+				gui.add( audioSettings, 'showReadout' )
+					.name( 'audio readout (DEV)' )
+					.onChange( updateAudioReadoutVisibility );
+
+				const audioFolder = gui.addFolder( 'audio mapping' );
+				audioFolder.add( audioMapping, 'enabled' ).name( 'enabled' );
+				audioFolder.add( audioMapping, 'subBassAttack', 0.01, 1.0, 0.01 ).name( 'attract attack α' );
+				audioFolder.add( audioMapping, 'subBassRelease', 0.01, 1.0, 0.01 ).name( 'attract release α' );
+				audioFolder.add( audioMapping, 'separationSmoothing', 0.005, 0.5, 0.005 ).name( 'separate α (slow)' );
+				audioFolder.add( audioMapping, 'attractFloor', 0.0, 5.0, 0.05 ).name( 'attract @ subBass=0' );
+				audioFolder.add( audioMapping, 'attractCeiling', 0.0, 8.0, 0.05 ).name( 'attract @ subBass=1' );
+				audioFolder.add( audioMapping, 'separationFloor', 0.0, 60.0, 0.5 ).name( 'separate @ subBass=0' );
+				audioFolder.add( audioMapping, 'separationCeiling', 0.0, 80.0, 0.5 ).name( 'separate @ subBass=1' );
+				audioFolder.add( audioMapping, 'trebleAttack', 0.01, 1.0, 0.01 ).name( 'speed attack α' );
+				audioFolder.add( audioMapping, 'trebleRelease', 0.01, 1.0, 0.01 ).name( 'speed release α' );
+				audioFolder.add( audioMapping, 'maxSpeedFloor', 4.0, 25.0, 0.5 ).name( 'maxSpeed @ treble=0' );
+				audioFolder.add( audioMapping, 'maxSpeedCeiling', 4.0, 30.0, 0.5 ).name( 'maxSpeed @ treble=1' );
+				audioFolder.add( audioMapping, 'shockwaveEnabled' ).name( 'shockwave enabled' );
+				audioFolder.add( audioMapping, 'spikeThreshold', 0.0, 0.6, 0.01 ).name( 'spike threshold' );
+				audioFolder.add( audioMapping, 'spikeGain', 0.0, 5.0, 0.05 ).name( 'spike gain' );
+				audioFolder.add( audioMapping, 'spikeDecay', 0.80, 0.99, 0.005 ).name( 'spike decay' );
+				audioFolder.add( audioMapping, 'shockwaveSourceY', -400.0, 400.0, 10.0 ).name( 'shock source Y' );
+				audioFolder.add( audioMapping, 'shockwaveReach', 100.0, 2000.0, 25.0 ).name( 'shock reach' );
+				audioFolder.add( audioMapping, 'verticalLift', 0.0, 800.0, 10.0 ).name( 'vertical lift (Y max)' );
+				audioFolder.add( audioMapping, 'freedomEnabled' ).name( 'freedom (subBass⁻¹) enabled' );
+				audioFolder.add( audioMapping, 'freedomFloor', 0.0, 2.0, 0.05 ).name( 'freedom @ subBass=1' );
+				audioFolder.add( audioMapping, 'freedomCeiling', 0.0, 3.0, 0.05 ).name( 'freedom @ subBass=0' );
+				audioFolder.add( audioMapping, 'midSmoothing', 0.005, 0.5, 0.005 ).name( 'mid α (slow)' );
+				audioFolder.add( audioMapping, 'alignmentFloor', 5.0, 80.0, 0.5 ).name( 'alignment @ mid=0' );
+				audioFolder.add( audioMapping, 'alignmentCeiling', 5.0, 100.0, 0.5 ).name( 'alignment @ mid=1' );
+				audioFolder.add( audioMapping, 'lowMidSmoothing', 0.005, 0.5, 0.005 ).name( 'lowMid α (slow)' );
+				audioFolder.add( audioMapping, 'cohesionFloor', 5.0, 80.0, 0.5 ).name( 'cohesion @ lowMid=0' );
+				audioFolder.add( audioMapping, 'cohesionCeiling', 5.0, 100.0, 0.5 ).name( 'cohesion @ lowMid=1' );
+				audioFolder.add( audioMapping, 'twinkleEnabled' ).name( 'twinkle enabled' );
+				audioFolder.add( audioMapping, 'twinkleInvert' ).name( 'twinkle: darken (else brighten)' );
+				audioFolder.add( audioMapping, 'airSmoothing', 0.005, 0.5, 0.005 ).name( 'air α' );
+				audioFolder.add( audioMapping, 'twinkleStrength', 0.0, 0.5, 0.01 ).name( 'twinkle strength' );
+
+				audioFolder.add( audioMapping, 'turnRateEnabled' ).name( 'turn-rate enabled' );
+				audioFolder.add( audioMapping, 'upperMidAttack', 0.01, 1.0, 0.01 ).name( 'upperMid attack α' );
+				audioFolder.add( audioMapping, 'upperMidRelease', 0.01, 1.0, 0.01 ).name( 'upperMid release α' );
+				audioFolder.add( audioMapping, 'upperMidGate', 0.0, 0.5, 0.01 ).name( 'upperMid gate' );
+				audioFolder.add( audioMapping, 'upperMidCurve', 1.0, 3.0, 0.1 ).name( 'upperMid curve (pow)' );
+				audioFolder.add( audioMapping, 'turnFloor', 1.0, 25.0, 0.5 ).name( 'turn-rate @ upMid=0' );
+				audioFolder.add( audioMapping, 'turnCeiling', 1.0, 40.0, 0.5 ).name( 'turn-rate @ upMid=1' );
+
+				audioFolder.add( audioMapping, 'shearEnabled' ).name( 'shear enabled' );
+				audioFolder.add( audioMapping, 'shearFloor', 0.0, 2.0, 0.05 ).name( 'shear @ upMid=0' );
+				audioFolder.add( audioMapping, 'shearCeiling', 0.0, 4.0, 0.05 ).name( 'shear @ upMid=1' );
+
+				audioFolder.add( audioMapping, 'upperMidSpeedEnabled' ).name( 'upMid→speed enabled' );
+				audioFolder.add( audioMapping, 'upperMidSpeedFactor', 0.0, 1.5, 0.05 ).name( 'upMid speed × treble' );
+				audioFolder.open();
+
+				const colorFolder = gui.addFolder( 'colour' );
+				colorFolder.add( colorMapping, 'enabled' ).name( 'enabled' );
+				colorFolder.add( colorMapping, 'palette', Object.keys( PALETTE_PRESETS ) ).name( 'palette' );
+				colorFolder.add( colorMapping, 'tScale', 0.0, 5.0, 0.05 ).name( 't scale (bass swell)' );
+				colorFolder.add( colorMapping, 'onsetBoost', 0.0, 1.0, 0.01 ).name( 't onset boost (kicks)' );
+				colorFolder.add( colorMapping, 'onsetSmoothing', 0.01, 0.5, 0.01 ).name( 'kick rise-time α' );
+				colorFolder.add( colorMapping, 'tOffset', 0.0, 1.0, 0.01 ).name( 't offset' );
+				colorFolder.add( colorMapping, 'intensity', 0.5, 4.0, 0.05 ).name( 'intensity' );
+				colorFolder.add( backgroundMapping, 'preset', Object.keys( BACKGROUND_PRESETS ) )
+					.name( 'background' )
+					.onChange( setBackground );
+				colorFolder.open();
+
+				gui.close();
+
+				createAudioReadoutPanel();
+				createBandTogglesPanel();
+				startAudioEngine();
+
+				initBirds();
+
+			}
+
+			// ===== GPGPU compute setup =====
+			function initComputeRenderer() {
+
+				gpuCompute = new GPUComputationRenderer( WIDTH, WIDTH, renderer );
+
+				const dtPosition = gpuCompute.createTexture();
+				const dtVelocity = gpuCompute.createTexture();
+				fillPositionTexture( dtPosition );
+				fillVelocityTexture( dtVelocity );
+
+				velocityVariable = gpuCompute.addVariable( 'textureVelocity', document.getElementById( 'fragmentShaderVelocity' ).textContent, dtVelocity );
+				positionVariable = gpuCompute.addVariable( 'texturePosition', document.getElementById( 'fragmentShaderPosition' ).textContent, dtPosition );
+
+				gpuCompute.setVariableDependencies( velocityVariable, [ positionVariable, velocityVariable ] );
+				gpuCompute.setVariableDependencies( positionVariable, [ positionVariable, velocityVariable ] );
+
+				positionUniforms = positionVariable.material.uniforms;
+				velocityUniforms = velocityVariable.material.uniforms;
+
+				positionUniforms[ 'time' ] = { value: 0.0 };
+				positionUniforms[ 'delta' ] = { value: 0.0 };
+				velocityUniforms[ 'time' ] = { value: 1.0 };
+				velocityUniforms[ 'delta' ] = { value: 0.0 };
+				velocityUniforms[ 'testing' ] = { value: 1.0 };
+				velocityUniforms[ 'separationDistance' ] = { value: 1.0 };
+				velocityUniforms[ 'alignmentDistance' ] = { value: 1.0 };
+				velocityUniforms[ 'cohesionDistance' ] = { value: 1.0 };
+				velocityUniforms[ 'freedomFactor' ] = { value: 1.0 };
+
+				velocityUniforms[ 'shockwaveStrength' ] = { value: 0.0 };
+				velocityUniforms[ 'shockwaveSourceY' ] = { value: -200.0 };
+				velocityUniforms[ 'shockwaveReach' ]   = { value: 250.0 };
+
+				velocityUniforms[ 'cellTexture' ]   = { value: null };
+				velocityUniforms[ 'gridDim' ]       = { value: new THREE.Vector3( GRID_X, GRID_Y, GRID_Z ) };
+				velocityUniforms[ 'cellSize' ]      = { value: CELL_SIZE.clone() };
+				velocityUniforms[ 'worldMin' ]      = { value: WORLD_MIN.clone() };
+				velocityUniforms[ 'slotsPerCell' ]  = { value: SLOTS_PER_CELL };
+				velocityUniforms[ 'posTexDim' ]     = { value: WIDTH };
+				velocityUniforms[ 'cellTexDim' ]    = { value: new THREE.Vector2( CELL_TEX_W, CELL_TEX_H ) };
+
+				velocityUniforms[ 'shapeCenter' ]        = { value: new THREE.Vector3( 0, 0, 0 ) };
+				velocityUniforms[ 'attractionStrength' ] = { value: 1.9 };
+
+				velocityUniforms[ 'drift' ]              = { value: new THREE.Vector3( 0.1, 0, 0 ) };
+				velocityUniforms[ 'minSpeed' ]           = { value: 2.0 };
+
+				velocityUniforms[ 'velocityDamping' ]    = { value: 0.98 };
+
+				velocityUniforms[ 'maxSpeed' ]           = { value: 9.0 };
+
+				velocityUniforms[ 'maxTurnRate' ]        = { value: 1000.0 };
+
+				velocityUniforms[ 'shearStrength' ]      = { value: 0.0 };
+
+				velocityUniforms[ 'groundY' ]              = { value: GROUND_Y };
+				velocityUniforms[ 'groundRepelHeight' ]    = { value: GROUND_REPEL_HEIGHT };
+				velocityUniforms[ 'groundRepelStrength' ]  = { value: GROUND_REPEL_STRENGTH };
+
+				velocityUniforms[ 'boxMin' ]               = { value: BOX_MIN.clone() };
+				velocityUniforms[ 'boxMax' ]               = { value: BOX_MAX.clone() };
+				velocityUniforms[ 'boxRepelMargin' ]       = { value: BOX_REPEL_MARGIN };
+				velocityUniforms[ 'boxRepelStrength' ]     = { value: BOX_REPEL_STRENGTH };
+
+				velocityUniforms[ 'cameraPos' ]            = { value: new THREE.Vector3() };
+				velocityUniforms[ 'cameraRepelRadius' ]    = { value: CAMERA_REPEL_RADIUS };
+				velocityUniforms[ 'cameraRepelStrength' ]  = { value: CAMERA_REPEL_STRENGTH };
+
+				velocityVariable.material.defines.BOUNDS = BOUNDS.toFixed( 2 );
+
+				velocityVariable.wrapS = THREE.RepeatWrapping;
+				velocityVariable.wrapT = THREE.RepeatWrapping;
+				positionVariable.wrapS = THREE.RepeatWrapping;
+				positionVariable.wrapT = THREE.RepeatWrapping;
+
+				const error = gpuCompute.init();
+
+				if ( error !== null ) {
+
+					console.error( error );
+
+				}
+
+				initCellBuilder();
+
+			}
+
+			function initCellBuilder() {
+
+				cellRT = new THREE.WebGLRenderTarget( CELL_TEX_W, CELL_TEX_H, {
+					type: THREE.FloatType,
+					format: THREE.RGBAFormat,
+					magFilter: THREE.NearestFilter,
+					minFilter: THREE.NearestFilter,
+					wrapS: THREE.ClampToEdgeWrapping,
+					wrapT: THREE.ClampToEdgeWrapping,
+					depthBuffer: false,
+					stencilBuffer: false
+				} );
+
+				cellBuilderMat = new THREE.ShaderMaterial( {
+
+					defines: {
+						MAX_BIRDS: BIRDS.toFixed( 0 )
+					},
+					uniforms: {
+						positionTexture: { value: null },
+						gridDim:         { value: new THREE.Vector3( GRID_X, GRID_Y, GRID_Z ) },
+						cellSize:        { value: CELL_SIZE.clone() },
+						worldMin:        { value: WORLD_MIN.clone() },
+						slotsPerCell:    { value: SLOTS_PER_CELL },
+						birdCount:       { value: BIRDS },
+						posTexDim:       { value: WIDTH },
+						cellTexDim:      { value: new THREE.Vector2( CELL_TEX_W, CELL_TEX_H ) }
+					},
+					vertexShader: 'void main() { gl_Position = vec4( position.xy, 0.0, 1.0 ); }',
+					fragmentShader: document.getElementById( 'cellBuilderFrag' ).textContent
+				} );
+
+				cellBuilderScene = new THREE.Scene();
+				cellBuilderScene.add( new THREE.Mesh( new THREE.PlaneGeometry( 2, 2 ), cellBuilderMat ) );
+				cellBuilderCamera = new THREE.OrthographicCamera( -1, 1, 1, -1, 0, 1 );
+
+				velocityUniforms[ 'cellTexture' ].value = cellRT.texture;
+
+			}
+
+			function buildCellTexture() {
+
+				cellBuilderMat.uniforms.positionTexture.value =
+					gpuCompute.getCurrentRenderTarget( positionVariable ).texture;
+
+				const prevTarget = renderer.getRenderTarget();
+				renderer.setRenderTarget( cellRT );
+				renderer.render( cellBuilderScene, cellBuilderCamera );
+				renderer.setRenderTarget( prevTarget );
+
+			}
+
+			function initBirds() {
+
+				const geometry = new BirdGeometry();
+
+				birdUniforms = {
+					'color': { value: new THREE.Color( 0xff2200 ) },
+					'texturePosition': { value: null },
+					'textureVelocity': { value: null },
+					'time': { value: 1.0 },
+					'delta': { value: 0.0 },
+
+					'paletteEnabled':   { value: 1.0 },
+					'paletteT':         { value: 0.0 },
+					'paletteA':         { value: new THREE.Vector3( 0.5, 0.5, 0.5 ) },
+					'paletteB':         { value: new THREE.Vector3( 0.5, 0.5, 0.5 ) },
+					'paletteC':         { value: new THREE.Vector3( 1.0, 0.7, 0.4 ) },
+					'paletteD':         { value: new THREE.Vector3( 0.0, 0.15, 0.20 ) },
+					'paletteIntensity': { value: 2.0 },
+
+					'twinkleAmount':    { value: 0.0 }
+				};
+
+				const material = new THREE.ShaderMaterial( {
+					uniforms: birdUniforms,
+					vertexShader: document.getElementById( 'birdVS' ).textContent,
+					fragmentShader: document.getElementById( 'birdFS' ).textContent,
+					side: THREE.DoubleSide
+
+				} );
+
+				const birdMesh = new THREE.Mesh( geometry, material );
+				birdMesh.rotation.y = Math.PI / 2;
+				birdMesh.matrixAutoUpdate = false;
+				birdMesh.updateMatrix();
+
+				scene.add( birdMesh );
+
+			}
+
+			function fillPositionTexture( texture ) {
+
+				const theArray = texture.image.data;
+
+				for ( let k = 0, kl = theArray.length; k < kl; k += 4 ) {
+
+					const x = ( Math.random() - 0.5 ) * ( BOX_MAX.x - BOX_MIN.x ) * 0.8;
+					const y = ( Math.random() - 0.5 ) * 400 + 50;
+					const z = ( Math.random() - 0.5 ) * ( BOX_MAX.z - BOX_MIN.z ) * 0.8;
+
+					theArray[ k + 0 ] = x;
+					theArray[ k + 1 ] = y;
+					theArray[ k + 2 ] = z;
+					theArray[ k + 3 ] = 1;
+
+				}
+
+			}
+
+			function fillVelocityTexture( texture ) {
+
+				const theArray = texture.image.data;
+
+				for ( let k = 0, kl = theArray.length; k < kl; k += 4 ) {
+
+					const x = Math.random() - 0.5;
+					const y = Math.random() - 0.5;
+					const z = Math.random() - 0.5;
+
+					theArray[ k + 0 ] = x * 10;
+					theArray[ k + 1 ] = y * 10;
+					theArray[ k + 2 ] = z * 10;
+					theArray[ k + 3 ] = 1;
+
+				}
+
+			}
+
+			function onWindowResize() {
+
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.updateProjectionMatrix();
+
+				renderer.setSize( window.innerWidth, window.innerHeight );
+
+			}
+
+			function animate() {
+
+				render();
+				stats.update();
+
+			}
+
+			// ===== Render loop: smooth audio, drive uniforms, draw =====
+			function render() {
+
+				const now = performance.now();
+				let delta = ( now - last ) / 1000;
+
+				if ( delta > 1 ) delta = 1;
+				last = now;
+
+				calibrationTick( now, delta );
+
+				positionUniforms[ 'time' ].value = now;
+				positionUniforms[ 'delta' ].value = delta;
+				velocityUniforms[ 'time' ].value = now;
+				velocityUniforms[ 'delta' ].value = delta;
+				birdUniforms[ 'time' ].value = now;
+				birdUniforms[ 'delta' ].value = delta;
+
+				if ( audioMapping.enabled ) {
+
+					const bassTarget = audioState.bands.bass;
+					// Asymmetric smoothing: fast attack, slow release.
+					const ba = ( bassTarget > audioSmoothed.bass )
+						? audioMapping.subBassAttack
+						: audioMapping.subBassRelease;
+					audioSmoothed.bass = audioSmoothed.bass * ( 1 - ba ) + bassTarget * ba;
+
+					const subBassTarget = audioState.bands.subBass;
+					const sba = ( subBassTarget > audioSmoothed.subBass )
+						? audioMapping.subBassAttack
+						: audioMapping.subBassRelease;
+					audioSmoothed.subBass = audioSmoothed.subBass * ( 1 - sba ) + subBassTarget * sba;
+					const tAttract = Math.max( 0, Math.min( 1, audioSmoothed.subBass ) );
+
+					const s = audioMapping.separationSmoothing;
+					audioSmoothed.subBassForSep = audioSmoothed.subBassForSep * ( 1 - s ) + subBassTarget * s;
+					const tSep = Math.max( 0, Math.min( 1, audioSmoothed.subBassForSep ) );
+
+					const trebleTarget = audioState.bands.treble;
+					const ta = ( trebleTarget > audioSmoothed.treble )
+						? audioMapping.trebleAttack
+						: audioMapping.trebleRelease;
+					audioSmoothed.treble = audioSmoothed.treble * ( 1 - ta ) + trebleTarget * ta;
+					const tSpeed = Math.max( 0, Math.min( 1, audioSmoothed.treble ) );
+
+					const midTarget = audioState.bands.mid;
+					const ms = audioMapping.midSmoothing;
+					audioSmoothed.mid = audioSmoothed.mid * ( 1 - ms ) + midTarget * ms;
+					const tAlign = Math.max( 0, Math.min( 1, audioSmoothed.mid ) );
+
+					const lowMidTarget = audioState.bands.lowMid;
+					const lms = audioMapping.lowMidSmoothing;
+					audioSmoothed.lowMid = audioSmoothed.lowMid * ( 1 - lms ) + lowMidTarget * lms;
+					const tCohesion = Math.max( 0, Math.min( 1, audioSmoothed.lowMid ) );
+
+					const airTarget = audioState.bands.air;
+					const aas = audioMapping.airSmoothing;
+					audioSmoothed.air = audioSmoothed.air * ( 1 - aas ) + airTarget * aas;
+					const tAir = Math.max( 0, Math.min( 1, audioSmoothed.air ) );
+
+					// upperMid envelope: fast attack / slow release, then gate + curve.
+					const upperMidTarget = audioState.bands.upperMid;
+					const uma = ( upperMidTarget > audioSmoothed.upperMid )
+						? audioMapping.upperMidAttack
+						: audioMapping.upperMidRelease;
+					audioSmoothed.upperMid = audioSmoothed.upperMid * ( 1 - uma ) + upperMidTarget * uma;
+					const umGate = audioMapping.upperMidGate;
+					const umGated = Math.max( 0, ( audioSmoothed.upperMid - umGate ) / Math.max( 1e-4, 1 - umGate ) );
+					const tUpperMid = Math.pow( Math.min( 1, umGated ), audioMapping.upperMidCurve );
+
+					if ( audioMapping.bandEnabled.subBass ) {
+
+						audioSmoothed.drivenAttract =
+							audioMapping.attractFloor + ( audioMapping.attractCeiling - audioMapping.attractFloor ) * tAttract;
+						velocityUniforms[ 'attractionStrength' ].value = audioSmoothed.drivenAttract;
+
+						audioSmoothed.drivenSeparation =
+							audioMapping.separationFloor + ( audioMapping.separationCeiling - audioMapping.separationFloor ) * tSep;
+						velocityUniforms[ 'separationDistance' ].value = audioSmoothed.drivenSeparation;
+
+						if ( audioMapping.freedomEnabled ) {
+							const tFreedom = 1.0 - tAttract;
+							audioSmoothed.drivenFreedom =
+								audioMapping.freedomFloor + ( audioMapping.freedomCeiling - audioMapping.freedomFloor ) * tFreedom;
+							velocityUniforms[ 'freedomFactor' ].value = audioSmoothed.drivenFreedom;
+						} else {
+							audioSmoothed.drivenFreedom = effectController.freedom;
+							velocityUniforms[ 'freedomFactor' ].value = effectController.freedom;
+						}
+
+						audioSmoothed.drivenShapeY = audioMapping.verticalLift * tSep;
+						velocityUniforms[ 'shapeCenter' ].value.set( 0, audioSmoothed.drivenShapeY, 0 );
+
+					} else {
+
+						velocityUniforms[ 'attractionStrength' ].value = effectController.attractionStrength;
+						velocityUniforms[ 'separationDistance' ].value = effectController.separation;
+						velocityUniforms[ 'freedomFactor' ].value = effectController.freedom;
+						velocityUniforms[ 'shapeCenter' ].value.set( 0, 0, 0 );
+						audioSmoothed.drivenAttract = effectController.attractionStrength;
+						audioSmoothed.drivenSeparation = effectController.separation;
+						audioSmoothed.drivenFreedom = effectController.freedom;
+						audioSmoothed.drivenShapeY = 0;
+					}
+
+					// maxSpeed = treble (full span) + upperMid (partial span), additive.
+					const speedSpan = audioMapping.maxSpeedCeiling - audioMapping.maxSpeedFloor;
+					const speedBase = audioMapping.bandEnabled.treble
+						? ( audioMapping.maxSpeedFloor + speedSpan * tSpeed )
+						: effectController.maxSpeed;
+					const speedAdd = ( audioMapping.bandEnabled.upperMid && audioMapping.upperMidSpeedEnabled )
+						? ( speedSpan * audioMapping.upperMidSpeedFactor * tUpperMid )
+						: 0;
+					audioSmoothed.drivenMaxSpeed = speedBase + speedAdd;
+					velocityUniforms[ 'maxSpeed' ].value = audioSmoothed.drivenMaxSpeed;
+
+					if ( audioMapping.bandEnabled.upperMid && audioMapping.turnRateEnabled ) {
+						audioSmoothed.drivenTurnRate =
+							audioMapping.turnFloor + ( audioMapping.turnCeiling - audioMapping.turnFloor ) * tUpperMid;
+						velocityUniforms[ 'maxTurnRate' ].value = audioSmoothed.drivenTurnRate;
+					} else {
+						audioSmoothed.drivenTurnRate = 1000.0;
+						velocityUniforms[ 'maxTurnRate' ].value = 1000.0;
+					}
+
+					if ( audioMapping.bandEnabled.upperMid && audioMapping.shearEnabled ) {
+						audioSmoothed.drivenShear =
+							audioMapping.shearFloor + ( audioMapping.shearCeiling - audioMapping.shearFloor ) * tUpperMid;
+						velocityUniforms[ 'shearStrength' ].value = audioSmoothed.drivenShear;
+					} else {
+						audioSmoothed.drivenShear = 0;
+						velocityUniforms[ 'shearStrength' ].value = 0;
+					}
+
+					if ( audioMapping.bandEnabled.mid ) {
+						audioSmoothed.drivenAlignment =
+							audioMapping.alignmentFloor + ( audioMapping.alignmentCeiling - audioMapping.alignmentFloor ) * tAlign;
+						velocityUniforms[ 'alignmentDistance' ].value = audioSmoothed.drivenAlignment;
+					} else {
+						velocityUniforms[ 'alignmentDistance' ].value = effectController.alignment;
+						audioSmoothed.drivenAlignment = effectController.alignment;
+					}
+
+					if ( audioMapping.bandEnabled.lowMid ) {
+						audioSmoothed.drivenCohesion =
+							audioMapping.cohesionFloor + ( audioMapping.cohesionCeiling - audioMapping.cohesionFloor ) * tCohesion;
+						velocityUniforms[ 'cohesionDistance' ].value = audioSmoothed.drivenCohesion;
+					} else {
+						velocityUniforms[ 'cohesionDistance' ].value = effectController.cohesion;
+						audioSmoothed.drivenCohesion = effectController.cohesion;
+					}
+
+					if ( audioMapping.bandEnabled.air && audioMapping.twinkleEnabled ) {
+
+						const sign = audioMapping.twinkleInvert ? -1 : 1;
+						audioSmoothed.drivenTwinkle = tAir * audioMapping.twinkleStrength * sign;
+						birdUniforms[ 'twinkleAmount' ].value = audioSmoothed.drivenTwinkle;
+					} else {
+						audioSmoothed.drivenTwinkle = 0;
+						birdUniforms[ 'twinkleAmount' ].value = 0;
+					}
+
+					audioSmoothed.shockwaveEnvelope = audioState.onsetEnvelopes.bass;
+					velocityUniforms[ 'shockwaveStrength' ].value =
+						audioMapping.shockwaveEnabled ? audioSmoothed.shockwaveEnvelope : 0;
+					velocityUniforms[ 'shockwaveSourceY' ].value = audioMapping.shockwaveSourceY;
+					velocityUniforms[ 'shockwaveReach' ].value   = audioMapping.shockwaveReach;
+				} else {
+					velocityUniforms[ 'attractionStrength' ].value = effectController.attractionStrength;
+					velocityUniforms[ 'separationDistance' ].value = effectController.separation;
+					velocityUniforms[ 'alignmentDistance' ].value = effectController.alignment;
+					velocityUniforms[ 'cohesionDistance' ].value = effectController.cohesion;
+					velocityUniforms[ 'maxSpeed' ].value = effectController.maxSpeed;
+					velocityUniforms[ 'freedomFactor' ].value = effectController.freedom;
+					velocityUniforms[ 'shockwaveStrength' ].value = 0;
+					velocityUniforms[ 'shapeCenter' ].value.set( 0, 0, 0 );
+					velocityUniforms[ 'maxTurnRate' ].value = 1000.0;
+					velocityUniforms[ 'shearStrength' ].value = 0;
+					birdUniforms[ 'twinkleAmount' ].value = 0;
+					audioSmoothed.drivenAttract = effectController.attractionStrength;
+					audioSmoothed.drivenSeparation = effectController.separation;
+					audioSmoothed.drivenAlignment = effectController.alignment;
+					audioSmoothed.drivenCohesion = effectController.cohesion;
+					audioSmoothed.drivenMaxSpeed = effectController.maxSpeed;
+					audioSmoothed.drivenFreedom = effectController.freedom;
+					audioSmoothed.drivenTwinkle = 0;
+					audioSmoothed.drivenTurnRate = 1000.0;
+					audioSmoothed.drivenShear = 0;
+					audioSmoothed.shockwaveEnvelope = 0;
+					audioSmoothed.drivenShapeY = 0;
+				}
+
+				if ( cameraSettings.orbitEnabled ) {
+
+					const phase = ( ( now - orbitStart ) / 1000 / ORBIT_PERIOD ) * Math.PI * 2;
+					camera.position.set(
+						Math.sin( phase ) * cameraSettings.camDistance,
+						cameraSettings.povHeight,
+						Math.cos( phase ) * cameraSettings.camDistance
+					);
+
+				} else {
+
+					camera.position.y = cameraSettings.povHeight;
+					camera.position.z = cameraSettings.camDistance;
+
+				}
+				camera.lookAt( 0, 250, 0 );
+
+				velocityUniforms[ 'cameraPos' ].value.copy( camera.position );
+
+				buildCellTexture();
+
+				gpuCompute.compute();
+
+				birdUniforms[ 'texturePosition' ].value = gpuCompute.getCurrentRenderTarget( positionVariable ).texture;
+				birdUniforms[ 'textureVelocity' ].value = gpuCompute.getCurrentRenderTarget( velocityVariable ).texture;
+
+				if ( colorMapping.enabled ) {
+					const preset = PALETTE_PRESETS[ colorMapping.palette ] || PALETTE_PRESETS.sunset;
+					birdUniforms[ 'paletteA' ].value.set( preset.a[ 0 ], preset.a[ 1 ], preset.a[ 2 ] );
+					birdUniforms[ 'paletteB' ].value.set( preset.b[ 0 ], preset.b[ 1 ], preset.b[ 2 ] );
+					birdUniforms[ 'paletteC' ].value.set( preset.c[ 0 ], preset.c[ 1 ], preset.c[ 2 ] );
+					birdUniforms[ 'paletteD' ].value.set( preset.d[ 0 ], preset.d[ 1 ], preset.d[ 2 ] );
+
+					const onsetTarget = ( audioMapping.enabled && audioMapping.bandEnabled.bass )
+						? audioState.onsetEnvelopes.bass
+						: 0;
+					const ons = colorMapping.onsetSmoothing;
+					audioSmoothed.bassOnsetForColour =
+						audioSmoothed.bassOnsetForColour * ( 1 - ons ) + onsetTarget * ons;
+
+					let paletteT = colorMapping.tOffset;
+					if ( audioMapping.enabled && audioMapping.bandEnabled.bass ) {
+						paletteT += audioSmoothed.bass * colorMapping.tScale;
+						paletteT += audioSmoothed.bassOnsetForColour * colorMapping.onsetBoost;
+					}
+					birdUniforms[ 'paletteT' ].value         = paletteT;
+					birdUniforms[ 'paletteIntensity' ].value = colorMapping.intensity;
+					birdUniforms[ 'paletteEnabled' ].value   = 1.0;
+				} else {
+					birdUniforms[ 'paletteEnabled' ].value = 0.0;
+				}
+
+				renderer.render( scene, camera );
+
+				updateAudioStatus( now );
+				updateAudioReadout( now );
+
+			}
+
+</script>
+	</body>
+</html>
